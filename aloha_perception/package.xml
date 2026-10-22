@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>aloha_perception</name>
+  <version>0.1.0</version>
+  <description>YOLO once plus KCF tracker and aligned RealSense XYZ visualization.</description>
+  <maintainer email="maintainer@example.invalid">ALOHA research lab</maintainer>
+  <license>License to be chosen by project maintainers</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
