@@ -1,0 +1,37 @@
+
+# ROS 2 / Colcon build files
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+.env
+
+# YOLO model weights
+*.pt
+*.pth
+runs/
+datasets/
+
+# Camera recordings and ROS bags
+*.bag
+*.db3
+*.mcap
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+
+# Temporary files
+*.log
+*.tmp
