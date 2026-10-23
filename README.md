@@ -50,7 +50,7 @@ cd ~/aloha_tracking_ws
 source /opt/ros/humble/setup.bash
 source ~/interbotix_ws/install/setup.bash
 colcon build --packages-select aloha_perception
- source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
 ros2 pkg prefix aloha_perception
 ros2 pkg executables aloha_perception
 ```
