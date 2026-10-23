@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>aloha_perception</name>
+  <name>aloha_tracking_perception</name>
   <version>0.1.0</version>
   <description>YOLO once plus KCF tracker and aligned RealSense XYZ visualization.</description>
   <maintainer email="maintainer@example.invalid">ALOHA research lab</maintainer>

@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'aloha_perception'
+package_name = 'aloha_tracking_perception'
 setup(
     name=package_name,
     version='0.1.0',
@@ -16,7 +16,7 @@ setup(
     description='YOLO-once KCF tracker, aligned RealSense XYZ, and separate visualization',
     license='License to be chosen by project maintainers',
     entry_points={'console_scripts': [
-        'detector = aloha_perception.detection:main',
-        'tracking_viewer = aloha_perception.visualization:main',
+        'detector = aloha_tracking_perception.detection:main',
+        'tracking_viewer = aloha_tracking_perception.visualization:main',
     ]},
 )
