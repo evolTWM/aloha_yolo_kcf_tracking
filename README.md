@@ -50,7 +50,7 @@ cd ~/aloha_tracking_ws
 source /opt/ros/humble/setup.bash
 source ~/interbotix_ws/install/setup.bash
 colcon build --packages-select aloha_perception
-source ~/aloha_tracking_ws/install/setup.bash
+ source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
 ros2 pkg prefix aloha_perception
 ros2 pkg executables aloha_perception
 ```
@@ -74,7 +74,7 @@ Both RGB and aligned depth must publish; expected optical frame IDs and RGB Came
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/interbotix_ws/install/setup.bash
-source ~/aloha_tracking_ws/install/setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
 ros2 run aloha_perception detector --ros-args \
   -p model_path:=yolov8s.pt \
   -p target_class:=truck \
@@ -90,7 +90,7 @@ On first successful detection, logs should say `Truck acquired; ... switching to
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/interbotix_ws/install/setup.bash
-source ~/aloha_tracking_ws/install/setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
 ros2 topic echo /aloha/perception/detections
 ```
 
@@ -116,7 +116,7 @@ Option B (separate viewer process with cv2 on its own main thread):
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/interbotix_ws/install/setup.bash
-source ~/aloha_tracking_ws/install/setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
 ros2 run aloha_perception tracking_viewer
 # Press q to close
 ```
