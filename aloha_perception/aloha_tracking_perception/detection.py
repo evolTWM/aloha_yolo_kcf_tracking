@@ -39,8 +39,8 @@ class RealSenseDetection(Node):
         if not YOLO_AVAILABLE:
             raise RuntimeError("Ultralytics not available.")
 
-        self.model = YOLO('yolov8m.pt')
-        self.get_logger().info(f"Loaded pretrained YOLOv8m with classes: {self.model.names}")
+        self.model = YOLO('yolov8n.pt')
+        self.get_logger().info(f"Loaded pretrained YOLOv8n with classes: {self.model.names}")
 
         self.target_classes = ['truck', 'train']
 
@@ -151,8 +151,10 @@ class RealSenseDetection(Node):
             return
 
         try:
-            rgb = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            # rgb = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
+            # bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            
+            bgr = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception as e:
             return
 
