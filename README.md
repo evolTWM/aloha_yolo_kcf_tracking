@@ -13,7 +13,7 @@ The current implementation detects **trucks and trains** with YOLO (`yolov8m.pt`
 - Python dependencies already configured for ROS 2, OpenCV, NumPy, CV Bridge, and Ultralytics
 - `yolov8m.pt` available to the detector
 
-**Package name:** `aloha_tracking_perception`  
+**Package name:** `aloha_tracking_perception`
 **Detector executable:** `detector`
 
 ## 1. Clone and build
@@ -29,9 +29,9 @@ Move or clone the repository under your workspace's `src/` directory, then build
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/interbotix_ws/install/setup.bash
-cd /path/to/your/workspace
+cd ~/interbotix_ws/src/aloha_tracking_ws/
 colcon build --packages-select aloha_tracking_perception
-source /path/to/your/workspace/install/setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
 ```
 
 Confirm ROS 2 can find the installed package:
@@ -58,7 +58,7 @@ source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
 After sourcing the three setup files:
 
 ```bash
-ros2 launch aloha aloha_bringup.launch.py is_mobile:=false use_base:=false use_joystick_teleop:=false use_cameras:=false
+ros2 launch aloha aloha_bringup.launch.py is_mobile:=false use_base:=false use_joystick_teleop:=false use_cameras:=false
 ```
 
 Use this only when approved by the lab operator. Bringup may start robot hardware processes; it is not required solely to inspect an already-running camera stream. Keep this terminal open.
@@ -68,7 +68,7 @@ Use this only when approved by the lab operator. Bringup may start robot hardwar
 After sourcing the three setup files:
 
 ```bash
-ros2 launch realsense2_camera rs_launch.py   camera_namespace:=cam_high   camera_name:=camera   serial_no:=_021222070323   enable_color:=true   enable_depth:=true   align_depth.enable:=true   enable_infra1:=false   enable_infra2:=false   enable_gyro:=false   enable_accel:=false   pointcloud.enable:=false   rgb_camera.color_profile:=640,480,15   depth_module.depth_profile:=640,480,15
+ros2 launch realsense2_camera rs_launch.py camera_namespace:=cam_high camera_name:=camera serial_no:=_021222070323 enable_color:=true enable_depth:=true align_depth.enable:=true enable_infra1:=false enable_infra2:=false enable_gyro:=false enable_accel:=false pointcloud.enable:=false rgb_camera.color_profile:=640,480,15 depth_module.depth_profile:=640,480,15
 ```
 
 This is the **lab-provided launch command**. Confirm that it exists on your workstation and publishes the expected `cam_high` topics. Do **not** start a second camera driver if the RealSense camera is already running. Keep this terminal open.
