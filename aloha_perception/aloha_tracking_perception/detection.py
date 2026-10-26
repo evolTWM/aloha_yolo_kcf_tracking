@@ -151,10 +151,9 @@ class RealSenseDetection(Node):
             return
 
         try:
-            # rgb = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
-            # bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            rgb = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             
-            bgr = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception as e:
             return
 
