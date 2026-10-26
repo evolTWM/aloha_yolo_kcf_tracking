@@ -1,6 +1,4 @@
-"""Tracking, geometry and filtering utilities; no ROS dependencies."""
-from dataclasses import dataclass
-
+"""Pure tracking, geometry and filtering utilities for the ALOHA perception node."""
 import numpy as np
 
 
@@ -27,108 +25,6 @@ def clip_bbox(bbox, width, height):
     if x2 - x1 < 4 or y2 - y1 < 4:
         return None
     return (x1, y1, x2 - x1, y2 - y1)
-
-
-@dataclass(frozen=True)
-class Target:
-    label: str
-    detection_confidence: float
-    bbox: tuple  # (x, y, width, height), in pixels
-    method: str  # YOLO acquisition or KCF update; confidence is always from YOLO
-
-
-class YoloKcfTracker:
-    """Acquire one target, update KCF only, and reacquire after loss.
-
-    detect(frame) returns (label, confidence, xywh) candidates. The highest
-    confidence candidate wins; reacquisition does not guarantee object identity.
-    Call step with a clean BGR frame, before drawing any annotations.
-    """
-
-    def __init__(self, tracker_factory, search_interval=0.5):
-        if not np.isfinite(search_interval) or search_interval < 0:
-            raise ValueError('search_interval must be finite and nonnegative')
-        self.tracker_factory = tracker_factory
-        self.search_interval = search_interval
-        self.yolo_calls = 0
-        self.kcf_updates = 0
-        self._shape = None
-        self.reset()
-
-    @property
-    def state(self):
-        return 'TRACKING' if self._tracker is not None else 'SEARCHING'
-
-    def reset(self, reason=''):
-        self._tracker = None
-        self.target = None
-        self.last_event = reason
-        self._last_search = None
-
-    @staticmethod
-    def _visible_box(bbox, width, height):
-        x, y, w, h = [float(v) for v in bbox]
-        clipped = clip_bbox(bbox, width, height)
-        if clipped is None:
-            return None
-        # Do not keep tracking a tiny sliver outside the image.
-        if not (0 <= x + w / 2 < width and 0 <= y + h / 2 < height):
-            return None
-        if clipped[2] * clipped[3] < 0.5 * w * h:
-            return None
-        return clipped
-
-    def step(self, frame, now, detect):
-        height, width = frame.shape[:2]
-        if self._shape is not None and self._shape != (height, width):
-            self.reset('Image size changed; searching again')
-        self._shape = (height, width)
-
-        if self._tracker is not None:
-            self.kcf_updates += 1
-            try:
-                ok, bbox = self._tracker.update(frame)
-                clipped = self._visible_box(bbox, width, height) if ok else None
-            except Exception as exc:
-                self.reset(f'KCF update failed: {exc}')
-                return None
-            if clipped is None:
-                self.reset('KCF lost target; searching again')
-                # Publish an empty result for the loss frame. YOLO resumes on
-                # the next frame, without waiting for the search interval.
-                return None
-            self.target = Target(self.target.label,
-                                 self.target.detection_confidence, clipped, 'KCF')
-            return self.target
-
-        if self._last_search is not None and now - self._last_search < self.search_interval:
-            return None
-        self._last_search = now
-        self.yolo_calls += 1
-        try:
-            candidates = sorted(detect(frame), key=lambda item: item[1], reverse=True)
-        except Exception as exc:
-            self.last_event = f'YOLO failed: {exc}'
-            return None
-        for label, confidence, bbox in candidates:
-            clipped = self._visible_box(bbox, width, height)
-            if clipped is None:
-                continue
-            try:
-                tracker = self.tracker_factory()
-                initialized = tracker.init(frame, clipped)
-                # Modern OpenCV returns None on success; legacy may return bool.
-                if initialized is not None and not initialized:
-                    self.last_event = 'KCF initialization failed; searching again'
-                    continue
-            except Exception as exc:
-                self.last_event = f'KCF initialization failed: {exc}'
-                continue
-            self._tracker = tracker
-            self.target = Target(label, confidence, clipped, 'YOLO')
-            self.last_event = f'YOLO acquired {label}; KCF initialized'
-            return self.target
-        return None
 
 
 def depth_at_target(depth_mm, bbox, depth_min=0.15, depth_max=3.0):
