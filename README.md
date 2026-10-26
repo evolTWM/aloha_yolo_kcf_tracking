@@ -2,15 +2,16 @@
 
 ROS 2 package for detecting objects using YOLO and estimating their 3D positions using an Intel RealSense depth camera.
 
-The current implementation detects **trucks and trains** with YOLO (`yolov8m.pt`), reads synchronized RGB and aligned depth images, and estimates **camera-relative X, Y, Z coordinates in meters** using the camera intrinsics. It also publishes an annotated image showing the detection box, center point, depth, and coordinates.
+The detector uses YOLO (`yolov8m.pt`) to acquire **one truck or train**, then follows it with **OpenCV KCF without running YOLO during successful tracking**. When KCF reports failure or an invalid/out-of-frame box, the detector clears the old target and resumes YOLO search. It publishes an annotated RGB image and estimates **camera-relative XYZ in meters** when recent aligned depth and matching intrinsics are available.
 
-> **Current status:** This is a YOLO-based detection pipeline. **KCF tracking and Kalman filtering are planned future additions; they are not implemented in the current version.** The reported XYZ point is a depth measurement near the center of the detected box, not the object's geometric center or a robot-base coordinate.
+> **Current stage:** YOLO acquisition → KCF tracking → YOLO reacquisition. **Kalman filtering is not enabled.** An unused Kalman utility remains in `tracking.py` for a later stage. XYZ is a visible-surface depth measurement near the box center, not the geometric object center or a robot-base coordinate.
 
 ## Requirements
 
 - Ubuntu with ROS 2 Humble and the lab's ALOHA setup
 - Intel RealSense camera and the lab's RealSense ROS 2 driver
-- Python dependencies already configured for ROS 2, OpenCV, NumPy, CV Bridge, and Ultralytics
+- Python dependencies already configured for ROS 2, OpenCV **with KCF**, NumPy, CV Bridge, and Ultralytics
+- Either `cv2.TrackerKCF_create` or `cv2.legacy.TrackerKCF_create` in the **same Python environment used by ROS 2**
 - `yolov8m.pt` available to the detector
 
 **Package name:** `aloha_tracking_perception`  
@@ -58,7 +59,7 @@ source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
 After sourcing the three setup files:
 
 ```bash
-ros2 launch aloha aloha_bringup.launch.py is_mobile:=false use_base:=false use_joystick_teleop:=false use_cameras:=false
+ros2 launch aloha aloha_bringup.launch.py is_mobile:=false use_base:=false use_joystick_teleop:=false use_cameras:=false
 ```
 
 Use this only when approved by the lab operator. Bringup may start robot hardware processes; it is not required solely to inspect an already-running camera stream. Keep this terminal open.
@@ -68,7 +69,7 @@ Use this only when approved by the lab operator. Bringup may start robot hardwar
 After sourcing the three setup files:
 
 ```bash
-ros2 launch realsense2_camera rs_launch.py   camera_namespace:=cam_high   camera_name:=camera   serial_no:=_021222070323   enable_color:=true   enable_depth:=true   align_depth.enable:=true   enable_infra1:=false   enable_infra2:=false   enable_gyro:=false   enable_accel:=false   pointcloud.enable:=false   rgb_camera.color_profile:=640,480,15   depth_module.depth_profile:=640,480,15
+ros2 launch realsense2_camera rs_launch.py   camera_namespace:=cam_high   camera_name:=camera   serial_no:=_021222070323   enable_color:=true   enable_depth:=true   align_depth.enable:=true   enable_infra1:=false   enable_infra2:=false   enable_gyro:=false   enable_accel:=false   pointcloud.enable:=false   rgb_camera.color_profile:=640,480,15   depth_module.depth_profile:=640,480,15
 ```
 
 This is the **lab-provided launch command**. Confirm that it exists on your workstation and publishes the expected `cam_high` topics. Do **not** start a second camera driver if the RealSense camera is already running. Keep this terminal open.
@@ -88,10 +89,16 @@ Press `Ctrl+C` to stop each frequency check. The image topics must have an activ
 After sourcing the three setup files:
 
 ```bash
-ros2 run aloha_tracking_perception detector
+ros2 run aloha_tracking_perception detector --ros-args -p "target_classes:=[truck]"
 ```
 
-The detector subscribes to the overhead camera's color, aligned depth, and camera-info topics and publishes detection measurements and an annotated image. Keep this terminal open.
+Omit the parameter to allow both `truck` and `train`. Start only this detector for the test; a separately running old YOLO detector would publish conflicting debug images. The node fails at startup with a clear error if KCF is unavailable. Check the ROS Python environment without changing its packages:
+
+```bash
+python3 -c "import cv2; print(cv2.__version__); print('KCF:', hasattr(cv2, 'TrackerKCF_create') or hasattr(getattr(cv2, 'legacy', None), 'TrackerKCF_create'))"
+```
+
+The detector subscribes to color, aligned depth and camera info. RGB drives tracking independently; missing or stale depth does not freeze the box. Keep this terminal open.
 
 ### Terminal 4 — Image viewer
 
@@ -107,7 +114,15 @@ Select:
 /aloha/perception/debug_image
 ```
 
-The viewer should show YOLO boxes with center points, measured depth, and XYZ coordinates **when the camera is publishing and a target has valid depth data**.
+The viewer shows:
+
+- `SEARCHING`: YOLO searches every 0.5 seconds by default; RGB images continue publishing between searches.
+- Yellow box + `[YOLO]`: the acquisition frame that initializes KCF.
+- Green box + `[KCF]`: subsequent KCF updates, with a red center point and pixel `(u, v)`.
+- `YOLO calls` and `KCF updates`: cumulative counters for verifying that YOLO stops during successful tracking.
+- XYZ if valid, or an `XYZ unavailable` message while the 2D box keeps tracking.
+
+The initial YOLO frame may be too brief to see at camera frame rate.
 
 ## 3. Read the XYZ output
 
@@ -123,6 +138,10 @@ A typical detection includes:
 {
   "label": "truck",
   "confidence": 0.91,
+  "confidence_source": "last_yolo_detection",
+  "tracking_method": "KCF",
+  "u": 337,
+  "v": 207,
   "cx_3d": 0.020,
   "cy_3d": -0.040,
   "cz_3d": 0.734,
@@ -132,24 +151,45 @@ A typical detection includes:
 }
 ```
 
-*The numbers above are examples, not measured values.* The topic uses a `std_msgs/String` containing a JSON array; it may contain multiple detections or `[]` when none can be reported.
+*The numbers above are examples, not measured values.* The topic uses a `std_msgs/String` containing a JSON array with **at most one target**. It publishes `[]` when the target is lost **or** valid XYZ cannot be measured. `confidence` is the last YOLO acquisition score, not a KCF confidence score. `tracking_method` identifies whether the current box came from YOLO or KCF.
 
-## Current implementation
+## Pipeline and stage-one acceptance test
 
-1. YOLO detects a target (`truck` or `train`) in the RGB image.
-2. The center pixel `(u, v)` is calculated from the detection box.
-3. The aligned depth image provides a median depth value near that pixel.
-4. The camera intrinsics convert the pixel and depth to camera-frame XYZ.
-5. The detector publishes JSON results to `/aloha/perception/detections` and an annotated image to `/aloha/perception/debug_image`.
+1. Place the truck on the table. In `SEARCHING`, YOLO selects the highest-confidence allowed target and initializes KCF on the clean BGR image.
+2. Move the truck slowly. The green box and red center point should follow. `KCF updates` increases while `YOLO calls` stays fixed.
+3. Move the truck fully out of view. When KCF returns failure, throws an error, or reports an invalid/out-of-frame box, the node discards the box, publishes `[]`, and logs `KCF lost target` (or the failure reason).
+4. YOLO resumes on the next RGB callback, then searches at the configured interval while no target is found. Return the truck to view; a new acquisition should restore the green KCF box.
+5. Depth failures should not stop steps 1–4. XYZ uses a small center patch, valid depth range 0.15–3.0 m, and matching camera metadata. It is not filtered by Kalman.
 
-YOLO currently runs on each processed image pair; there is **no persistent KCF object tracking yet**.
+**Limits:** KCF is a visual tracker, not a semantic detector. It can drift onto background or a similar object while reporting success. This stage does not periodically run YOLO to detect such drift. Reacquisition selects the most confident allowed object, so it does not preserve identity if several trucks are visible. KCF's fixed box scale also limits large distance/scale changes. Validate with the actual truck, lighting and camera; synthetic tests do not establish lab FPS or tracking reliability.
 
-## Future work
+### Parameters
 
-- **KCF tracking:** Run YOLO to acquire a target, then follow that target across subsequent frames without running YOLO on every frame.
-- **Kalman filtering:** Smooth XYZ measurements and estimate target motion.
-- **Target reacquisition:** Re-run YOLO if tracking is lost.
-- **Validation:** Measure detection accuracy, coordinate error, frame rate, and end-to-end latency on the lab workstation.
+| Parameter | Default | Purpose |
+|---|---|---|
+| `model` | `yolov8m.pt` | YOLO acquisition weights |
+| `target_classes` | `[truck, train]` | Allowed model class names |
+| `confidence` | `0.30` | Minimum YOLO acquisition confidence |
+| `search_interval` | `0.5` seconds | Minimum interval between empty-scene YOLO attempts; bypassed after tracking loss |
+| `max_depth_age` | `0.10` seconds | Maximum absolute RGB/depth timestamp difference for XYZ |
+
+These parameters are set at node startup. Setting `search_interval:=0.0` searches every processed RGB frame **only while SEARCHING**. There is no periodic YOLO inference during successful KCF tracking.
+
+### Software checks
+
+From the repository root:
+
+```bash
+PYTHONPATH=aloha_perception python3 -m unittest discover -s aloha_perception/test -v
+```
+
+The state-machine tests do not require ROS or a YOLO model. Adapter tests use ROS message/publisher stubs and real OpenCV; the optional real-KCF test follows a deterministic moving texture, loses it on a blank frame, and reacquires it. OpenCV-dependent tests are skipped if their dependency is unavailable. No camera, ROS middleware, GPU or robot behavior is simulated as a hardware validation.
+
+## Next stage
+
+- Add Kalman filtering after the YOLO/KCF acceptance test passes on the lab workstation.
+- Validate XYZ jitter, motion lag, coordinate error, processed frame rate and latency independently.
+- Add drift checks if KCF falsely reports success after the target leaves; this needs separate validation and may require occasional YOLO verification.
 
 ## Notes
 

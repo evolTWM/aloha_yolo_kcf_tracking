@@ -1,249 +1,208 @@
 #!/usr/bin/env python3
-"""
-ALOHA overhead-camera object detector
-Uses a supplied YOLO model and aligned RealSense Depth
-Publishes labeled camera-relative XYZ coordinates in meters.
-"""
-print("LATEST UPDATE (WORKING FOR THE MOST PART)")
-import os
-import rclpy, threading, json
-import message_filters
-from rclpy.qos import qos_profile_sensor_data
-from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
-from std_msgs.msg import String
-from cv_bridge import CvBridge
-import cv2, numpy as np
+"""YOLO acquisition, KCF tracking and optional aligned RealSense XYZ."""
+import json
+import time
 
-try:
-    from ultralytics import YOLO
-    YOLO_AVAILABLE = True
-except:
-    YOLO_AVAILABLE = False
+import cv2
+import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from rclpy.node import Node
+from rclpy.qos import (
+    QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy,
+)
+from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import String
+from ultralytics import YOLO
+
+from .tracking import YoloKcfTracker, backproject, depth_at_target, make_kcf
+
 
 class RealSenseDetection(Node):
     def __init__(self):
         super().__init__('detector')
+        defaults = {
+            'rgb_topic': '/cam_high/camera/color/image_raw',
+            'depth_topic': '/cam_high/camera/aligned_depth_to_color/image_raw',
+            'info_topic': '/cam_high/camera/color/camera_info',
+            'output_topic': '/aloha/perception/detections',
+            'model': 'yolov8m.pt',
+            'target_classes': ['truck', 'train'],
+            'confidence': 0.30,
+            'search_interval': 0.5,
+            'max_depth_age': 0.10,
+        }
+        for name, value in defaults.items():
+            self.declare_parameter(name, value)
+        param = lambda name: self.get_parameter(name).value
+        self.confidence = float(param('confidence'))
+        self.max_depth_age = float(param('max_depth_age'))
+        if not np.isfinite(self.confidence) or not 0 < self.confidence <= 1:
+            raise ValueError('confidence must be in (0, 1]')
+        if not np.isfinite(self.max_depth_age) or self.max_depth_age < 0:
+            raise ValueError('max_depth_age must be finite and nonnegative')
 
-        self.bridge  = CvBridge()
-        self.fx = self.fy = self.cx = self.cy = None
+        # Fail clearly at startup if this ROS Python cannot create KCF.
+        make_kcf(cv2)
+        self.tracking = YoloKcfTracker(
+            lambda: make_kcf(cv2), float(param('search_interval')))
+        self.model = YOLO(param('model'))
+        targets = set(param('target_classes'))
+        self.target_ids = [index for index, name in self.model.names.items()
+                           if name in targets]
+        if not self.target_ids:
+            raise ValueError(f'No target classes {targets} in model {self.model.names}')
+        self.bridge = CvBridge()
         self.camera_info = None
-        self.depth = None
-        self._lock = threading.Lock()
-        # Debug preview window needs a real X11/Wayland display -- fine with
-        # someone logged into the GUI session, fatal (Qt xcb plugin abort)
-        # running headless over SSH, which is how this node runs on REAL-1.
-        self._has_display = bool(os.environ.get('DISPLAY'))
+        self.depth_msg = None
+        self._logged_event = ''
 
-        # YOLO
-        if not YOLO_AVAILABLE:
-            raise RuntimeError("Ultralytics not available.")
-
-        self.model = YOLO('yolov8m.pt')
-        self.get_logger().info(f"Loaded pretrained YOLOv8m with classes: {self.model.names}")
-
-        self.target_classes = ['truck', 'train']
-
-        # self.target_classes = ['fire-truck', 'screwdriver', 'cell-phone']
-
-        # Subscriptions
-        self.declare_parameter('rgb_topic', '/cam_high/camera/color/image_raw')
-        self.declare_parameter('depth_topic', '/cam_high/camera/aligned_depth_to_color/image_raw')
-        self.declare_parameter('info_topic', '/cam_high/camera/color/camera_info')
-
-        self.rgb_sub = message_filters.Subscriber(self, Image, self.get_parameter('rgb_topic').value, qos_profile=qos_profile_sensor_data)
-        self.depth_sub = message_filters.Subscriber(self, Image, self.get_parameter('depth_topic').value, qos_profile=qos_profile_sensor_data)
-        self.image_sync = message_filters.ApproximateTimeSynchronizer([self.rgb_sub, self.depth_sub], queue_size=5, slop=0.04)
-
-        self.image_sync.registerCallback(self._images_cb)
-
-        self.create_subscription(CameraInfo, self.get_parameter('info_topic').value, self._info_cb, qos_profile_sensor_data)
-
-        self.declare_parameter('output_topic', '/aloha/perception/detections')
-        self.det_pub = self.create_publisher(String, self.get_parameter('output_topic').value, 10)
-        self.debug_pub = self.create_publisher(Image, '/aloha/perception/debug_image', qos_profile_sensor_data)
-        self.get_logger().info('RealSense detection node ready')
+        # Keep only the latest frame. KCF receives RGB independently of depth:
+        # invalid/missing depth suppresses XYZ, not the box or debug image.
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST, depth=1,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE)
+        self.rgb_sub = self.create_subscription(Image, param('rgb_topic'), self._rgb_cb, qos)
+        self.depth_sub = self.create_subscription(Image, param('depth_topic'), self._depth_cb, qos)
+        self.info_sub = self.create_subscription(CameraInfo, param('info_topic'), self._info_cb, qos)
+        self.det_pub = self.create_publisher(String, param('output_topic'), 10)
+        self.debug_pub = self.create_publisher(Image, '/aloha/perception/debug_image', qos)
+        self.get_logger().info(
+            f'YOLO -> KCF ready; targets={targets}. No Kalman filtering enabled.')
 
     def _info_cb(self, msg):
-        fx = msg.k[0]
-        fy = msg.k[4]
-        cx = msg.k[2]
-        cy = msg.k[5]
+        fx, fy, cx, cy = msg.k[0], msg.k[4], msg.k[2], msg.k[5]
+        if np.isfinite([fx, fy, cx, cy]).all() and fx > 0 and fy > 0:
+            self.camera_info = msg
 
-        if not np.isfinite([fx, fy, cx, cy]).all() or fx <= 0 or fy <= 0:
-            self.get_logger().warn(
-                'Received invalid camera parameters'
-            )
-            return
+    def _depth_cb(self, msg):
+        self.depth_msg = msg
 
-        self.fx = fx
-        self.fy = fy
-        self.cx = cx
-        self.cy = cy
-        self.camera_info = msg
-    def _images_cb(self, rgb_msg, depth_msg):
-        if self.camera_info is None:
-            return
-        
-        if (self.camera_info.header.frame_id != rgb_msg.header.frame_id) or (self.camera_info.width != rgb_msg.width) or (self.camera_info.height != rgb_msg.height):
-            self.get_logger().warn('Color Camera does not match color image')
-            return
+    @staticmethod
+    def _stamp(msg):
+        return msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        if depth_msg.encoding != '16UC1':
-            self.get_logger().warn(
-                f'Expected 16UC1 depth, received {depth_msg.encoding}'
-            )
-            return
+    def _detect(self, frame):
+        candidates = []
+        results = self.model(frame, verbose=False, conf=self.confidence,
+                             classes=self.target_ids)
+        for result in results:
+            for box in result.boxes:
+                class_id = int(box.cls.item())
+                if class_id not in self.target_ids:
+                    continue
+                confidence = float(box.conf.item())
+                if confidence < self.confidence:
+                    continue
+                x1, y1, x2, y2 = box.xyxy[0].tolist()
+                candidates.append((self.model.names[class_id], confidence,
+                                   (x1, y1, x2 - x1, y2 - y1)))
+        return candidates
 
-        if (rgb_msg.width, rgb_msg.height) != (
-            depth_msg.width, depth_msg.height
-        ):
-            self.get_logger().warn(
-                'Color and aligned depth dimensions do not match'
-            )
-            return
-
-        if (
-            not rgb_msg.header.frame_id
-            or rgb_msg.header.frame_id != depth_msg.header.frame_id
-        ):
-            self.get_logger().warn(
-                'Color and aligned depth coordinate frames do not match'
-            )
-            return
-
-        try:
-            depth = self.bridge.imgmsg_to_cv2(depth_msg, '16UC1')
-        except Exception as exc:
-            self.get_logger().warn(f'Could not convert depth image: {exc}')
-            return
-
-        with self._lock:
-            self.depth = depth
-
-        self._rgb_cb(rgb_msg)
-
-    def _get_depth(self, u, v):
-        with self._lock:
-            if self.depth is None:
-                return 0.0
-            h, w = self.depth.shape
-            u = max(0, min(u, w-1))
-            v = max(0, min(v, h-1))
-            patch = self.depth[
-                max(0,v-8):min(h,v+8),
-                max(0,u-8):min(w,u+8)]
-            valid = patch[patch > 0]
-            if len(valid) == 0:
-                return 0.0
-            return float(np.median(valid)) / 1000.0
-
-    def _backproject(self, u, v, depth_m):
-        if depth_m < 0.1 or self.fx is None:
+    def _xyz(self, rgb_msg, bbox):
+        info, depth = self.camera_info, self.depth_msg
+        if info is None or depth is None:
             return None
-        cx3 = (u - self.cx) * depth_m / self.fx
-        cy3 = (v - self.cy) * depth_m / self.fy
-        cz3 = depth_m
-        return cx3, cy3, cz3
+        if (info.width, info.height) != (rgb_msg.width, rgb_msg.height):
+            return None
+        if (depth.width, depth.height) != (rgb_msg.width, rgb_msg.height):
+            return None
+        if not rgb_msg.header.frame_id or not (
+                rgb_msg.header.frame_id == depth.header.frame_id == info.header.frame_id):
+            return None
+        if abs(self._stamp(rgb_msg) - self._stamp(depth)) > self.max_depth_age:
+            return None
+        if depth.encoding != '16UC1':
+            return None
+        try:
+            depth_mm = self.bridge.imgmsg_to_cv2(depth, desired_encoding='16UC1')
+            sample = depth_at_target(depth_mm, bbox)
+        except Exception as exc:
+            self.get_logger().warn(f'Depth conversion: {exc}', throttle_duration_sec=3.0)
+            return None
+        if sample is None:
+            return None
+        u, v, z = sample
+        return backproject(u, v, z, (info.k[0], info.k[4], info.k[2], info.k[5]))
 
     def _rgb_cb(self, msg):
-        if self.fx is None:
-            return
-
         try:
-            rgb = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        except Exception as e:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as exc:
+            self.get_logger().warn(f'RGB conversion: {exc}', throttle_duration_sec=3.0)
             return
-
-        raw_detections = []
-        display = bgr.copy()
-
-        # yolo detection
-        if self.model is not None:
-            try:
-                results = self.model(bgr, verbose=False, conf=0.30)
-                if not results:    
-                    self.get_logger().warn("YOLO returned no results")
-                else:
-                    display = results[0].plot()
-                    observed = [(self.model.names[int(box.cls.item())], round(float(box.conf.item()), 3)) for box in results[0].boxes]
-
-                self.get_logger().info(f'YOLO sees: {observed}', throttle_duration_sec=2.0)
-                self.get_logger().info(f"Device: {next(self.model.model.parameters()).device}, Timing: {results[0].speed}", throttle_duration_sec=5.0)
-                for r in results:
-                    for box in r.boxes:
-                        cls_name = self.model.names[int(box.cls)]
-                        if cls_name not in self.target_classes:
-                            continue
-                        conf = float(box.conf)
-                        if conf < 0.30:
-                            continue
-                        x1,y1,x2,y2 = map(int, box.xyxy[0])
-                        u = (x1+x2)//2
-                        v = (y1+y2)//2
-                        raw_detections.append((cls_name, conf, u, v))
-            except Exception as e:
-                self.get_logger().warn(f'YOLO error: {e}')
-
-
-        if not raw_detections:
-            self.det_pub.publish(String(data='[]'))
-            preview = self.bridge.cv2_to_imgmsg(display, encoding='bgr8')
-            preview.header = msg.header
-            self.debug_pub.publish(preview)
-            return
-
+        # Never feed a box, label or red center point back into KCF.
+        target = self.tracking.step(frame, time.monotonic(), self._detect)
+        display = frame.copy()
         detections = []
+        if target is not None:
+            x, y, w, h = target.bbox
+            u, v = x + w // 2, y + h // 2
+            # Acquisition is yellow for one frame; KCF updates are green.
+            color = (0, 255, 0) if target.method == 'KCF' else (0, 255, 255)
+            cv2.rectangle(display, (x, y), (x + w - 1, y + h - 1), color, 2)
+            cv2.circle(display, (u, v), 5, (0, 0, 255), -1)
+            label_y = min(max(y - 10, 65), max(65, msg.height - 45))
+            self._text(display, f'{target.label} [{target.method}] Pixel: ({u}, {v})',
+                       (max(5, min(x, msg.width - 300)), label_y), color)
+            coords = self._xyz(msg, target.bbox)
+            if coords is not None:
+                cx3, cy3, cz3 = [float(value) for value in coords]
+                self._text(display, f'XYZ: ({cx3:.3f}, {cy3:.3f}, {cz3:.3f}) m',
+                           (5, msg.height - 15), color)
+                detections.append({
+                    'label': target.label,
+                    # This is the acquisition score, NOT a new KCF confidence.
+                    'confidence': round(target.detection_confidence, 3),
+                    'confidence_source': 'last_yolo_detection',
+                    'tracking_method': target.method,
+                    'u': u, 'v': v,
+                    'cx_3d': round(cx3, 4), 'cy_3d': round(cy3, 4), 'cz_3d': round(cz3, 4),
+                    'frame_id': msg.header.frame_id,
+                    'stamp': self._stamp(msg), 'source': 'realsense',
+                })
+            else:
+                self._text(display, 'XYZ unavailable (depth/info missing, invalid or stale)',
+                           (5, msg.height - 15), (0, 200, 255))
 
-        for label, conf, u, v in raw_detections:
-            depth_m = self._get_depth(u, v)
-            if depth_m < 0.1:
-                self.get_logger().warn(
-                    f'Truck detected but invalid depth at ({u}, {v}): {depth_m:.3f} m',
-                    throttle_duration_sec=2.0
-                )   
-                continue
-            coords = self._backproject(u, v, depth_m)
-            if coords is None:
-                continue
-            cx3, cy3, cz3 = coords
-
-            detections.append({
-                'label':      label,
-                'confidence': round(conf, 3),
-                'cx_3d':      round(cx3, 4),
-                'cy_3d':      round(cy3, 4),
-                'cz_3d':      round(cz3, 4),
-                'frame_id':   msg.header.frame_id,
-                'stamp':   msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
-                'source':     'realsense',
-            })
-
-            # Draw the center point
-            cv2.circle(display, (u, v), 6, (0, 0, 255), -1)
-
-            # Show pixel coordinates, depth, and 3D coordinates
-            cv2.putText(display, f"{label} {conf:.0%}", (u + 10, v - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-            cv2.putText(display, f"Pixel: ({u}, {v})  Depth: {depth_m:.3f} m", (u + 10, v - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-            cv2.putText(display, f"XYZ: ({cx3:.3f}, {cy3:.3f}, {cz3:.3f}) m", (u + 10, v + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2 )
-
+        status = (f'{self.tracking.state}  YOLO calls: {self.tracking.yolo_calls}'
+                  f'  KCF updates: {self.tracking.kcf_updates}')
+        self._text(display, status, (5, 22), (255, 255, 255))
+        if target is None:
+            self._text(display, 'Searching for truck/train...', (5, 45), (0, 200, 255))
+        event = self.tracking.last_event
+        if event and event != self._logged_event:
+            self.get_logger().info(event)
+            self._logged_event = event
         self.det_pub.publish(String(data=json.dumps(detections)))
         preview = self.bridge.cv2_to_imgmsg(display, encoding='bgr8')
         preview.header = msg.header
         self.debug_pub.publish(preview)
 
+    @staticmethod
+    def _text(display, text, position, color):
+        cv2.putText(display, text, position, cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(display, text, position, cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    color, 1, cv2.LINE_AA)
+
+
 def main(args=None):
     rclpy.init(args=args)
-    node = RealSenseDetection()
+    node = None
     try:
+        node = RealSenseDetection()
+        # Single-threaded executor serializes KCF state and latest depth/info.
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    if node._has_display:
-        cv2.destroyAllWindows()
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
