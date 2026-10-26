@@ -4,7 +4,7 @@ ALOHA overhead-camera object detector
 Uses a supplied YOLO model and aligned RealSense Depth
 Publishes labeled camera-relative XYZ coordinates in meters.
 """
-print("LATEST UPDATE (WORKING FOR THE MOST PART)")
+print("added KCF")
 import os
 import rclpy, threading, json
 import message_filters
@@ -15,7 +15,7 @@ from std_msgs.msg import String
 from cv_bridge import CvBridge
 import cv2, numpy as np
 
-# Added: reuse the KCF/OpenCV compatibility helpers already in this project.
+# the KCF/OpenCV compatibility helpers already in this project.
 from .tracking import make_kcf, clip_bbox
 
 try:
