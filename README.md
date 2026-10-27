@@ -68,7 +68,7 @@ Use this only when approved by the lab operator. Bringup may start robot hardwar
 After sourcing the three setup files:
 
 ```bash
-ros2 launch realsense2_camera rs_launch.py camera_namespace:=cam_high camera_name:=camera serial_no:=_021222070323 enable_color:=true enable_depth:=true align_depth.enable:=true enable_infra1:=false enable_infra2:=false enable_gyro:=false enable_accel:=false pointcloud.enable:=false rgb_camera.color_profile:=640,480,15 depth_module.depth_profile:=640,480,15
+ros2 launch realsense2_camera rs_launch.py camera_namespace:=cam_high camera_name:=camera serial_no:=_021222070323 enable_color:=true enable_depth:=true align_depth.enable:=true enable_infra1:=false enable_infra2:=false enable_gyro:=false enable_accel:=false pointcloud.enable:=false rgb_camera.color_profile:=640,480,60 depth_module.depth_profile:=640,480,60
 ```
 
 This is the **lab-provided launch command**. Confirm that it exists on your workstation and publishes the expected `cam_high` topics. Do **not** start a second camera driver if the RealSense camera is already running. Keep this terminal open.
