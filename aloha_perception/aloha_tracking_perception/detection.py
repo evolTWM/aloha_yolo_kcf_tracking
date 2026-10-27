@@ -4,16 +4,18 @@ ALOHA overhead-camera object detector
 Uses a supplied YOLO model and aligned RealSense Depth
 Publishes labeled camera-relative XYZ coordinates in meters.
 """
-print("LATEST UPDATE (WORKING FOR THE MOST PART)")
+print("LATEST UPDATE - L~")
 import os
+import time
 import rclpy, threading, json
 import message_filters
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.node import Node
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from std_msgs.msg import String
 from cv_bridge import CvBridge
 import cv2, numpy as np
+import torch
 
 try:
     from ultralytics import YOLO
@@ -24,27 +26,24 @@ except:
 class RealSenseDetection(Node):
     def __init__(self):
         super().__init__('detector')
-
+        self.device = 0 if torch.cuda.is_available() else 'cpu'
+        self.get_logger().info(f"YOLO device: {self.device}")
         self.bridge  = CvBridge()
         self.fx = self.fy = self.cx = self.cy = None
         self.camera_info = None
         self.depth = None
         self._lock = threading.Lock()
-        # Debug preview window needs a real X11/Wayland display -- fine with
-        # someone logged into the GUI session, fatal (Qt xcb plugin abort)
-        # running headless over SSH, which is how this node runs on REAL-1.
         self._has_display = bool(os.environ.get('DISPLAY'))
 
         # YOLO
         if not YOLO_AVAILABLE:
             raise RuntimeError("Ultralytics not available.")
 
-        self.model = YOLO('yolov8n.pt')
-        self.get_logger().info(f"Loaded pretrained YOLOv8n with classes: {self.model.names}")
+        self.model = YOLO('yolov8m.pt')
+        self.model.to('cuda')
+        self.get_logger().info(f"Loaded pretrained YOLOv8m with classes: {self.model.names}")
 
-        self.target_classes = ['truck', 'train']
-
-        # self.target_classes = ['fire-truck', 'screwdriver', 'cell-phone']
+        self.target_classes = ['truck', 'train', 'car']
 
         # Subscriptions
         self.declare_parameter('rgb_topic', '/cam_high/camera/color/image_raw')
@@ -53,7 +52,7 @@ class RealSenseDetection(Node):
 
         self.rgb_sub = message_filters.Subscriber(self, Image, self.get_parameter('rgb_topic').value, qos_profile=qos_profile_sensor_data)
         self.depth_sub = message_filters.Subscriber(self, Image, self.get_parameter('depth_topic').value, qos_profile=qos_profile_sensor_data)
-        self.image_sync = message_filters.ApproximateTimeSynchronizer([self.rgb_sub, self.depth_sub], queue_size=5, slop=0.04)
+        self.image_sync = message_filters.ApproximateTimeSynchronizer([self.rgb_sub, self.depth_sub], queue_size=1, slop=0.03)
 
         self.image_sync.registerCallback(self._images_cb)
 
@@ -61,7 +60,8 @@ class RealSenseDetection(Node):
 
         self.declare_parameter('output_topic', '/aloha/perception/detections')
         self.det_pub = self.create_publisher(String, self.get_parameter('output_topic').value, 10)
-        self.debug_pub = self.create_publisher(Image, '/aloha/perception/debug_image', qos_profile_sensor_data)
+        self.debug_pub = self.create_publisher(CompressedImage, '/aloha/perception/debug_image/compressed', qos_profile_sensor_data)
+        self._frame_count = 0
         self.get_logger().info('RealSense detection node ready')
 
     def _info_cb(self, msg):
@@ -149,51 +149,30 @@ class RealSenseDetection(Node):
     def _rgb_cb(self, msg):
         if self.fx is None:
             return
+        t0 = time.perf_counter()
+        self._frame_count += 1
+        want_debug = self.debug_pub.get_subscription_count() > 0 and self._frame_count % 2 == 0
 
         try:
-            rgb = self.bridge.imgmsg_to_cv2(msg, 'rgb8')
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            
+            bgr = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception as e:
             return
 
         raw_detections = []
-        display = bgr.copy()
+        display = bgr
 
         # yolo detection
         if self.model is not None:
             try:
-                results = self.model(bgr, verbose=False, conf=0.30)
-                if not results:    
-                    self.get_logger().warn("YOLO returned no results")
-                else:
-                    display = results[0].plot()
-                    observed = [(self.model.names[int(box.cls.item())], round(float(box.conf.item()), 3)) for box in results[0].boxes]
-
-                self.get_logger().info(f'YOLO sees: {observed}', throttle_duration_sec=2.0)
-                self.get_logger().info(f"Device: {next(self.model.model.parameters()).device}, Timing: {results[0].speed}", throttle_duration_sec=5.0)
-                for r in results:
-                    for box in r.boxes:
-                        cls_name = self.model.names[int(box.cls)]
-                        if cls_name not in self.target_classes:
-                            continue
-                        conf = float(box.conf)
-                        if conf < 0.30:
-                            continue
-                        x1,y1,x2,y2 = map(int, box.xyxy[0])
-                        u = (x1+x2)//2
-                        v = (y1+y2)//2
-                        raw_detections.append((cls_name, conf, u, v))
+                results = self.model(bgr, device=self.device, verbose=False, conf=0.30, classes=[2, 6, 7])
+                if results:
+                    boxes = results[0].boxes.cpu()
+                    for cls_id, conf, xyxy in zip(boxes.cls.tolist(), boxes.conf.tolist(), boxes.xyxy.tolist()):
+                        x1, y1, x2, y2 = map(int, xyxy)
+                        raw_detections.append((self.model.names[int(cls_id)], conf, (x1 + x2) // 2, (y1 + y2) // 2))
+                    self.get_logger().info(f'Detected {len(raw_detections)} | Timing: {results[0].speed}', throttle_duration_sec=2.0)
             except Exception as e:
                 self.get_logger().warn(f'YOLO error: {e}')
-
-
-        if not raw_detections:
-            self.det_pub.publish(String(data='[]'))
-            preview = self.bridge.cv2_to_imgmsg(display, encoding='bgr8')
-            preview.header = msg.header
-            self.debug_pub.publish(preview)
-            return
 
         detections = []
 
@@ -201,9 +180,9 @@ class RealSenseDetection(Node):
             depth_m = self._get_depth(u, v)
             if depth_m < 0.1:
                 self.get_logger().warn(
-                    f'Truck detected but invalid depth at ({u}, {v}): {depth_m:.3f} m',
+                    f'{label} detected but invalid depth at ({u}, {v}): {depth_m:.3f} m',
                     throttle_duration_sec=2.0
-                )   
+                )
                 continue
             coords = self._backproject(u, v, depth_m)
             if coords is None:
@@ -217,24 +196,29 @@ class RealSenseDetection(Node):
                 'cy_3d':      round(cy3, 4),
                 'cz_3d':      round(cz3, 4),
                 'frame_id':   msg.header.frame_id,
-                'stamp':   msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
+                'stamp':      msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
                 'source':     'realsense',
             })
 
-            # Draw the center point
-            cv2.circle(display, (u, v), 6, (0, 0, 255), -1)
+            if want_debug:
+                # Draw the center point
+                cv2.circle(display, (u, v), 6, (0, 0, 255), -1)
 
-            # Show pixel coordinates, depth, and 3D coordinates
-            cv2.putText(display, f"{label} {conf:.0%}", (u + 10, v - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-            cv2.putText(display, f"Pixel: ({u}, {v})  Depth: {depth_m:.3f} m", (u + 10, v - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-            cv2.putText(display, f"XYZ: ({cx3:.3f}, {cy3:.3f}, {cz3:.3f}) m", (u + 10, v + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2 )
+                # Show label, pixel coordinates, depth, and 3D coordinates
+                cv2.putText(display, f"{label} {conf:.0%}", (u + 10, v - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.putText(display, f"Pixel: ({u}, {v})  Depth: {depth_m:.3f} m", (u + 10, v - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.putText(display, f"XYZ: ({cx3:.3f}, {cy3:.3f}, {cz3:.3f}) m", (u + 10, v + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
         self.det_pub.publish(String(data=json.dumps(detections)))
-        preview = self.bridge.cv2_to_imgmsg(display, encoding='bgr8')
-        preview.header = msg.header
-        self.debug_pub.publish(preview)
+
+        if want_debug:
+            preview = CompressedImage()
+            preview.header = msg.header
+            preview.format = 'jpeg'
+            preview.data = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
+            self.debug_pub.publish(preview)
+
+        self.get_logger().info(f'callback total: {(time.perf_counter() - t0) * 1000:.1f} ms', throttle_duration_sec=2.0)
 
 def main(args=None):
     rclpy.init(args=args)
