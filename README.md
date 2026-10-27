@@ -9,7 +9,27 @@ The current implementation detects **trucks and trains** with YOLO (`yolov8m.pt`
 ## Requirements
 
 - Ubuntu with ROS 2 Humble and the lab's ALOHA setup
-- Intel RealSense camera and the lab's RealSense ROS 2 driver
+- Intel RealSense camera andTo ensure a clean environment and prevent "Device Busy" or shared memory errors, **always run this reset sequence before starting the pipeline** (especially if a previous node crashed).
+
+1. **Clear ROS 2 Shared Memory & Restart Daemon:**
+   ```bash
+   sudo rm -rf /dev/shm/*
+   ros2 daemon stop
+   ros2 daemon start
+
+2. **Hard-Reset USB Controllers & Verify Devices:**
+   ```bash
+   sudo bash -c '
+   echo -n 0000:00:14.0 > /sys/bus/pci/drivers/xhci_hcd/unbind
+   sleep 5
+   echo -n 0000:00:14.0 > /sys/bus/pci/drivers/xhci_hcd/bind
+   '
+   sleep 10
+
+   # Sanity check to confirm the USB devices are visible again
+   lsusb | grep 0403
+   ls -l /dev/ttyDXL_*
+   ``` the lab's RealSense ROS 2 driver
 - Python dependencies already configured for ROS 2, OpenCV, NumPy, CV Bridge, and Ultralytics
 - `yolov8m.pt` available to the detector
 
@@ -133,6 +153,28 @@ A typical detection includes:
 ```
 
 *The numbers above are examples, not measured values.* The topic uses a `std_msgs/String` containing a JSON array; it may contain multiple detections or `[]` when none can be reported.
+
+To ensure a clean environment and prevent "Device Busy" or shared memory errors, **always run this reset sequence before starting the pipeline** (especially if a previous node crashed).
+
+1. **Clear ROS 2 Shared Memory & Restart Daemon:**
+   ```bash
+   sudo rm -rf /dev/shm/*
+   ros2 daemon stop
+   ros2 daemon start
+
+2. **Hard-Reset USB Controllers & Verify Devices:**
+   ```bash
+   sudo bash -c '
+   echo -n 0000:00:14.0 > /sys/bus/pci/drivers/xhci_hcd/unbind
+   sleep 5
+   echo -n 0000:00:14.0 > /sys/bus/pci/drivers/xhci_hcd/bind
+   '
+   sleep 10
+
+   # Sanity check to confirm the USB devices are visible again
+   lsusb | grep 0403
+   ls -l /dev/ttyDXL_*
+   ```
 
 ## Current implementation
 
