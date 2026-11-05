@@ -4,7 +4,6 @@ ALOHA overhead-camera object detector
 Uses a supplied YOLO model and aligned RealSense Depth
 Publishes labeled camera-relative XYZ coordinates in meters.
 """
-print("LATEST UPDATE - L~")
 import os
 import time
 import rclpy, threading, json
@@ -17,16 +16,24 @@ from cv_bridge import CvBridge
 import cv2, numpy as np
 import torch
 
+if __package__:
+    from .workspace_overlay import WorkspaceOverlay
+else:
+    from workspace_overlay import WorkspaceOverlay
+
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
-except:
+except ImportError:
     YOLO_AVAILABLE = False
 
 class RealSenseDetection(Node):
     def __init__(self):
         super().__init__('detector')
-        self.device = 0 if torch.cuda.is_available() else 'cpu'
+        self.declare_parameter('device', 'auto')
+        self.declare_parameter('model', 'yolov8m.pt')
+        configured_device = self.get_parameter('device').value
+        self.device = ('cuda:0' if torch.cuda.is_available() else 'cpu') if configured_device == 'auto' else configured_device
         self.get_logger().info(f"YOLO device: {self.device}")
         self.bridge  = CvBridge()
         self.fx = self.fy = self.cx = self.cy = None
@@ -39,9 +46,10 @@ class RealSenseDetection(Node):
         if not YOLO_AVAILABLE:
             raise RuntimeError("Ultralytics not available.")
 
-        self.model = YOLO('yolov8m.pt')
-        self.model.to('cuda')
-        self.get_logger().info(f"Loaded pretrained YOLOv8m with classes: {self.model.names}")
+        model_path = os.path.expanduser(self.get_parameter('model').value)
+        self.model = YOLO(model_path)
+        self.model.to(self.device)
+        self.get_logger().info(f"Loaded {model_path} with classes: {self.model.names}")
 
         self.target_classes = ['truck', 'train', 'car']
 
@@ -61,8 +69,57 @@ class RealSenseDetection(Node):
         self.declare_parameter('output_topic', '/aloha/perception/detections')
         self.det_pub = self.create_publisher(String, self.get_parameter('output_topic').value, 10)
         self.debug_pub = self.create_publisher(CompressedImage, '/aloha/perception/debug_image/compressed', qos_profile_sensor_data)
+        self.debug_raw_pub = self.create_publisher(Image, '/aloha/perception/debug_image', 1)
+        self.declare_parameter('workspace_topic', '/aloha/perception/detections_workspace_filtered')
+        self.declare_parameter('workspace_frame', 'table_workspace')
+        self.workspace_overlay = WorkspaceOverlay(frame=self.get_parameter('workspace_frame').value)
+        self.last_workspace_overlay = None
+        self.workspace_sub = self.create_subscription(
+            String, self.get_parameter('workspace_topic').value, self._workspace_cb, 10
+        )
         self._frame_count = 0
         self.get_logger().info('RealSense detection node ready')
+
+    def _has_debug_viewer(self):
+        return (self.debug_raw_pub.get_subscription_count() > 0
+                or self.debug_pub.get_subscription_count() > 0)
+
+    def _publish_debug(self, image, header):
+        if self.debug_raw_pub.get_subscription_count() > 0:
+            image = np.ascontiguousarray(image, dtype=np.uint8)
+            raw = Image()
+            raw.header = header
+            raw.height, raw.width = image.shape[:2]
+            raw.encoding = 'bgr8'
+            raw.is_bigendian = 0
+            raw.step = raw.width * 3
+            raw.data = image.tobytes()
+            self.debug_raw_pub.publish(raw)
+        if self.debug_pub.get_subscription_count() > 0:
+            ok, encoded = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            if ok:
+                preview = CompressedImage()
+                preview.header = header
+                preview.format = 'jpeg'
+                preview.data = encoded.tobytes()
+                self.debug_pub.publish(preview)
+
+    def _workspace_cb(self, msg):
+        if not self._has_debug_viewer():
+            self.workspace_overlay.clear()
+            return
+        try:
+            detections = json.loads(msg.data)
+        except (ValueError, TypeError):
+            self.workspace_overlay.clear()
+            return
+        rendered = self.workspace_overlay.render(
+            detections, self.get_clock().now().nanoseconds / 1e9
+        )
+        if rendered is not None:
+            image, header = rendered
+            self._publish_debug(image, header)
+            self.last_workspace_overlay = time.monotonic()
 
     def _info_cb(self, msg):
         fx = msg.k[0]
@@ -151,7 +208,7 @@ class RealSenseDetection(Node):
             return
         t0 = time.perf_counter()
         self._frame_count += 1
-        want_debug = self.debug_pub.get_subscription_count() > 0 and self._frame_count % 2 == 0
+        want_debug = self._has_debug_viewer() and self._frame_count % 2 == 0
 
         try:
             bgr = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
@@ -159,12 +216,17 @@ class RealSenseDetection(Node):
             return
 
         raw_detections = []
-        display = bgr
+        display = bgr.copy() if want_debug else bgr
 
         # yolo detection
         if self.model is not None:
             try:
-                results = self.model(bgr, device=self.device, verbose=False, conf=0.30, classes=[2, 6, 7])
+                # Car/train/truck boxes for the same toy must compete across
+                # classes; otherwise class-specific NMS can retain duplicates.
+                results = self.model(
+                    bgr, device=self.device, verbose=False, conf=0.30,
+                    classes=[2, 6, 7], agnostic_nms=True, iou=0.50,
+                )
                 if results:
                     boxes = results[0].boxes.cpu()
                     for cls_id, conf, xyxy in zip(boxes.cls.tolist(), boxes.conf.tolist(), boxes.xyxy.tolist()):
@@ -198,25 +260,35 @@ class RealSenseDetection(Node):
                 'frame_id':   msg.header.frame_id,
                 'stamp':      msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9,
                 'source':     'realsense',
+                'pixel_center': [u, v],
             })
 
             if want_debug:
                 # Draw the center point
                 cv2.circle(display, (u, v), 6, (0, 0, 255), -1)
 
-                # Show label, pixel coordinates, depth, and 3D coordinates
-                cv2.putText(display, f"{label} {conf:.0%}", (u + 10, v - 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                cv2.putText(display, f"Pixel: ({u}, {v})  Depth: {depth_m:.3f} m", (u + 10, v - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                cv2.putText(display, f"XYZ: ({cx3:.3f}, {cy3:.3f}, {cz3:.3f}) m", (u + 10, v + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                # Filtered XYZ arrives asynchronously on workspace_topic.
+                # Only the matching source frame will receive that overlay.
+                cv2.putText(display, f"{label} {conf:.0%}", (max(0,u-20), max(80,v-15)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+
+        if want_debug and detections:
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            self.workspace_overlay.remember(
+                stamp, display, msg.header,
+                [tuple(d['pixel_center']) for d in detections]
+            )
 
         self.det_pub.publish(String(data=json.dumps(detections)))
 
         if want_debug:
-            preview = CompressedImage()
-            preview.header = msg.header
-            preview.format = 'jpeg'
-            preview.data = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, 70])[1].tobytes()
-            self.debug_pub.publish(preview)
+            # Show a useful preview without presenting old XYZ as current.
+            waiting = self.last_workspace_overlay is None or time.monotonic()-self.last_workspace_overlay > .5
+            if not detections or waiting:
+                message = 'Waiting for filtered workspace coordinates' if detections else 'No valid object detection'
+                cv2.rectangle(display, (0,0), (min(display.shape[1]-1,850),40), (25,25,25), -1)
+                cv2.putText(display, message, (10,27), cv2.FONT_HERSHEY_SIMPLEX, .55, (0,220,255), 2)
+                self._publish_debug(display, msg.header)
 
         self.get_logger().info(f'callback total: {(time.perf_counter() - t0) * 1000:.1f} ms', throttle_duration_sec=2.0)
 

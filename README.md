@@ -1,160 +1,155 @@
 # ALOHA Object Detection and 3D Localization
 
-ROS 2 package for detecting objects using YOLO and estimating their 3D positions using an Intel RealSense depth camera.
-
-The current implementation detects **trucks and trains** with YOLO (`yolov8m.pt`), reads synchronized RGB and aligned depth images, and estimates **camera-relative X, Y, Z coordinates in meters** using the camera intrinsics. It also publishes an annotated image showing the detection box, center point, depth, and coordinates.
-
-> **Current status:** This is a YOLO-based detection pipeline. **KCF tracking and Kalman filtering are planned future additions; they are not implemented in the current version.** The reported XYZ point is a depth measurement near the center of the detected box, not the object's geometric center or a robot-base coordinate.
+>ROS 2 perception package for detecting toy vehicles with YOLO and estimating their 3D positions using synchronized Intel RealSense RGB and aligned depth images.
+>
+>The pipeline converts camera-relative measurements into the left robot base frame using a saved extrinsic calibration, applies an exponential moving average (EMA) filter, and publishes workspace coordinates with the table center as the XY origin. An annotated image displays the filtered workspace XYZ values in meters.
+>
+> **Current status**: YOLO detection, coordinate transformation, EMA smoothing, and the workspace overlay are implemented. KCF tracking and Kalman filtering are not used. They may be considered later if needed.
+>
+>The reported point represents a depth sample near the detection-box center; it is not necessarily the object’s geometric center or a validated grasp target.
 
 ## Requirements
 
-- Ubuntu with ROS 2 Humble and the lab's ALOHA setup
-- Intel RealSense camera andTo ensure a clean environment and prevent "Device Busy" or shared memory errors, **always run this reset sequence before starting the pipeline** (especially if a previous node crashed).
+- Ubuntu 22.04 with ROS 2 Humble
+- A configured ALOHA/Interbotix workspace and RealSense ROS 2 driver
+- An overhead RealSense camera publishing RGB, aligned depth, and CameraInfo
+- Python dependencies: OpenCV, NumPy, PyYAML, CV Bridge, message_filters, PyTorch, and Ultralytics
+- YOLO weights (`yolov8m.pt`) accessible to the detector
 
-1. **Clear ROS 2 Shared Memory & Restart Daemon:**
-   ```bash
-   sudo rm -rf /dev/shm/*
-   ros2 daemon stop
-   ros2 daemon start
+**ROS package:** `aloha_tracking_perception`
+**Executables:** `detector`, `yolo_to_robot`
 
-2. **Hard-Reset USB Controllers & Verify Devices:**
-   ```bash
-   sudo bash -c '
-   echo -n 0000:00:14.0 > /sys/bus/pci/drivers/xhci_hcd/unbind
-   sleep 5
-   echo -n 0000:00:14.0 > /sys/bus/pci/drivers/xhci_hcd/bind
-   '
-   sleep 10
-
-   # Sanity check to confirm the USB devices are visible again
-   lsusb | grep 0403
-   ls -l /dev/ttyDXL_*
-   ``` the lab's RealSense ROS 2 driver
-- Python dependencies already configured for ROS 2, OpenCV, NumPy, CV Bridge, and Ultralytics
-- `yolov8m.pt` available to the detector
-
-**Package name:** `aloha_tracking_perception`
-**Detector executable:** `detector`
+The bundled `calibration_candidate.yaml` and `lab_workspace.yaml` describe
+the lab's camera placement and workspace origin. Other setups must supply
+their own calibration and workspace origin.
 
 ## 1. Clone and build
 
-In a terminal with the ROS 2 and Interbotix environments available, clone the repository into the `src` directory of **your actual ROS 2 workspace**. Replace the paths below if your workspace is elsewhere.
+These commands use the lab's workspace layout. Adjust the paths if your
+Interbotix workspace is elsewhere.
 
 ```bash
+mkdir -p ~/interbotix_ws/src/aloha_tracking_ws
+cd ~/interbotix_ws/src/aloha_tracking_ws
+
 git clone https://github.com/evolTWM/aloha_yolo_kcf_tracking.git
-```
 
-Move or clone the repository under your workspace's `src/` directory, then build from the workspace root:
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH
 
-```bash
 source /opt/ros/humble/setup.bash
-source ~/interbotix_ws/install/setup.bash
-cd ~/interbotix_ws/src/aloha_tracking_ws/
-colcon build --packages-select aloha_tracking_perception
-source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
-```
+source ~/interbotix_ws/install/local_setup.bash
 
-Confirm ROS 2 can find the installed package:
+/usr/bin/colcon build \
+  --base-paths aloha_yolo_kcf_tracking/aloha_perception \
+  --packages-select aloha_tracking_perception
 
-```bash
+source install/local_setup.bash
+
 ros2 pkg prefix aloha_tracking_perception
 ros2 pkg executables aloha_tracking_perception
 ```
 
-> The directory holding `package.xml` must declare the package name `aloha_tracking_perception`. If the repository includes an extra wrapper directory, place or build the inner ROS package accordingly. Do not build a different copy of the package by accident.
+The package prefix should point inside
+`~/interbotix_ws/src/aloha_tracking_ws/install/`.
+
+The commands below use `local_setup.bash` to source the workspaces in an
+explicit order and avoid the lab's existing workspace-chain conflict.
+
+Place `yolov8m.pt` in `~/interbotix_ws/src/aloha_tracking_ws/`, or change the
+detector's `model` parameter to its actual path.
+
+This assumes dependencies from the requirements section are installed; cloning and building alone does not install PyTorch or Ultralytics.
 
 ## 2. Run the system (four terminals)
 
-**In every terminal**, source the following three environments in this order. Replace the third path with your actual tracking workspace's `install/setup.bash` location:
+### Terminal 1 - ALOHA bringup
 
 ```bash
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH
+
 source /opt/ros/humble/setup.bash
-source ~/interbotix_ws/install/setup.bash
-source ~/interbotix_ws/src/aloha_tracking_ws/install/setup.bash
+source ~/interbotix_ws/install/local_setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/local_setup.bash
+
+ros2 launch aloha aloha_bringup.launch.py
 ```
 
-### Terminal 1 — ALOHA bringup
+> Leave bringup running and wait for the arm drivers and overhead camera to initialize. If bringup is already running, use that instance.
 
-After sourcing the three setup files:
+### Terminal 2 - YOLO Detector
 
 ```bash
-ros2 launch aloha aloha_bringup.launch.py is_mobile:=false use_base:=false use_joystick_teleop:=false use_cameras:=false
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH
+
+source /opt/ros/humble/setup.bash
+source ~/interbotix_ws/install/local_setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/local_setup.bash
+
+ros2 run aloha_tracking_perception detector \
+  --ros-args \
+  -p model:="$HOME/interbotix_ws/src/aloha_tracking_ws/yolov8m.pt"
 ```
 
-Use this only when approved by the lab operator. Bringup may start robot hardware processes; it is not required solely to inspect an already-running camera stream. Keep this terminal open.
+> The detector reads synchronized overhead RGB and aligned depth images and publishes camera-relative detections. Leave this terminal running.
 
-### Terminal 2 — RealSense camera
-
-After sourcing the three setup files:
+### Terminal 3 - Coordinate Transformation & EMA Filter
 
 ```bash
-ros2 launch realsense2_camera rs_launch.py camera_namespace:=cam_high camera_name:=camera serial_no:=_021222070323 enable_color:=true enable_depth:=true align_depth.enable:=true enable_infra1:=false enable_infra2:=false enable_gyro:=false enable_accel:=false pointcloud.enable:=false rgb_camera.color_profile:=640,480,60 depth_module.depth_profile:=640,480,60
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH
+
+source /opt/ros/humble/setup.bash
+source ~/interbotix_ws/install/local_setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/local_setup.bash
+
+ros2 run aloha_tracking_perception yolo_to_robot
 ```
 
-This is the **lab-provided launch command**. Confirm that it exists on your workstation and publishes the expected `cam_high` topics. Do **not** start a second camera driver if the RealSense camera is already running. Keep this terminal open.
+> This node loads the saved calibration, transforms detections into robot-base coordinates, applies EMA smoothing, and publishes table-centered workspace coordinates. Leave it running alongside the detector.
 
-Check the image streams in another sourced shell if necessary:
-
-```bash
-ros2 topic info /cam_high/camera/color/image_raw
-ros2 topic hz /cam_high/camera/color/image_raw
-ros2 topic hz /cam_high/camera/aligned_depth_to_color/image_raw
-```
-
-Press `Ctrl+C` to stop each frequency check. The image topics must have an active publisher for detection to work.
-
-### Terminal 3 — YOLO detector
-
-After sourcing the three setup files:
+### Terminal 4 - Image viewer
 
 ```bash
-ros2 run aloha_tracking_perception detector
-```
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH
 
-The detector subscribes to the overhead camera's color, aligned depth, and camera-info topics and publishes detection measurements and an annotated image. Keep this terminal open.
+source /opt/ros/humble/setup.bash
+source ~/interbotix_ws/install/local_setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/local_setup.bash
 
-### Terminal 4 — Image viewer
-
-After sourcing the three setup files:
-
-```bash
 ros2 run rqt_image_view rqt_image_view
 ```
 
-Select:
+> Select /aloha/perception/debug_image without the /compressed suffix. With a valid detection, the overlay shows the filtered workspace XYZ values. XY is relative to the saved table center; Z remains relative to the left robot base
 
-```text
-/aloha/perception/debug_image
-```
+## 3. Read the coordinates
 
-The viewer should show YOLO boxes with center points, measured depth, and XYZ coordinates **when the camera is publishing and a target has valid depth data**.
-
-## 3. Read the XYZ output
-
-In another sourced terminal, run:
+In a fifth terminal:
 
 ```bash
-ros2 topic echo /aloha/perception/detections
+unset AMENT_PREFIX_PATH COLCON_PREFIX_PATH CMAKE_PREFIX_PATH PYTHONPATH
+
+source /opt/ros/humble/setup.bash
+source ~/interbotix_ws/install/local_setup.bash
+source ~/interbotix_ws/src/aloha_tracking_ws/install/local_setup.bash
+
+ros2 topic echo /aloha/perception/detections_workspace_filtered \
+  --field data
 ```
 
-A typical detection includes:
+The topic publishes a `std_msgs/String` containing a JSON array.
+Each detection includes its label, confidence, filtered `x`, `y`, `z`,
+frame identifier, and source timestamp. Values are in meters.
 
-```json
-{
-  "label": "truck",
-  "confidence": 0.91,
-  "cx_3d": 0.020,
-  "cy_3d": -0.040,
-  "cz_3d": 0.734,
-  "frame_id": "camera_color_optical_frame",
-  "stamp": 123.0,
-  "source": "realsense"
-}
-```
+|  |  |
+|---|---|
+| /aloha/perception/detections | Raw camera optical coordinates (cx_3d, cy_3d, cz_3d) |
+| /aloha/perception/detections_base | Unfiltered robot-base XYZ |
+| /aloha/perception/detections_base_filtered | EMA-filtered robot-base XYZ |
+| /aloha/perception/detections_workspace_filtered | Filtered XYZ with a table-centered XY origin |
 
-*The numbers above are examples, not measured values.* The topic uses a `std_msgs/String` containing a JSON array; it may contain multiple detections or `[]` when none can be reported.
+Workspace coordinates preserve the robot-base axis directions.
+Only the XY origin is shifted; Z is not tabletop-relative.
 
-To ensure a clean environment and prevent "Device Busy" or shared memory errors, **always run this reset sequence before starting the pipeline** (especially if a previous node crashed).
+Delete the entire repeated shared-memory/USB reset sequence. Those commands are machine-specific recovery actions, and the broad shared-memory deletion and controller reset should not be routine startup instructions.
 
 1. **Clear ROS 2 Shared Memory & Restart Daemon:**
    ```bash
@@ -178,11 +173,9 @@ To ensure a clean environment and prevent "Device Busy" or shared memory errors,
 
 ## Current implementation
 
-1. YOLO detects a target (`truck` or `train`) in the RGB image.
-2. The center pixel `(u, v)` is calculated from the detection box.
-3. The aligned depth image provides a median depth value near that pixel.
-4. The camera intrinsics convert the pixel and depth to camera-frame XYZ.
-5. The detector publishes JSON results to `/aloha/perception/detections` and an annotated image to `/aloha/perception/debug_image`.
+1. YOLO detects cars, trucks, and trains in the RGB image.
+2. A median of valid aligned-depth pixels near each detection-box center provides depth.
+3. Camera intrinsics convert the pixel and depth into camera optical XYZ.
 
 YOLO currently runs on each processed image pair; there is **no persistent KCF object tracking yet**.
 
@@ -200,3 +193,7 @@ YOLO currently runs on each processed image pair; there is **no persistent KCF o
 - This project only performs perception; it does not control the robot.
 - Launch commands and workspace locations can differ between lab machines. Use the versions installed and approved for your workstation.
 - To stop your test processes, press `Ctrl+C` in their terminals. Avoid stopping shared lab processes without coordination.
+
+## Credits
+* Dr. Mingyu Cai (REAL Lab Director)
+* Sashwat's Work on Kinova: https://github.com/Shashy2305/KinovaARM

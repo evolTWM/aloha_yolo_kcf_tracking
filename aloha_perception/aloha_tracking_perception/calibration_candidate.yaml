@@ -1,0 +1,25 @@
+# LAB-SPECIFIC CANDIDATE: replace for a different camera/robot mounting.
+status: Candidate; independent validation required
+parent_frame: follower_left/base_link
+camera_optical_frame: camera_color_optical_frame
+T_parent_camera_optical:
+- - 0.9977490226100761
+  - -0.013939188188498604
+  - 0.0655941073060943
+  - 0.3854928574609978
+- - -0.03626646848857107
+  - -0.9349321624802758
+  - 0.35296826319560726
+  - -0.364757564342795
+- - 0.0564059495443989
+  - -0.3545526062414457
+  - -0.9333331764506144
+  - 1.033166211507187
+- - 0.0
+  - 0.0
+  - 0.0
+  - 1.0
+solver: HORAUD
+translation_rms_m: 0.006303108619658742
+rotation_rms_deg: 1.1916401050687215
+source_session: cam_high_20261027_154707_614134

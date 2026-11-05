@@ -1,0 +1,8 @@
+# LAB-SPECIFIC EXAMPLE. These offsets are not universal ALOHA dimensions.
+# Re-measure the table origin and use a matching camera calibration elsewhere.
+# Z remains relative to follower_left/base_link, not height above the table.
+yolo_to_robot:
+  ros__parameters:
+    workspace_origin_x: 0.49811400265672584
+    workspace_origin_y: 0.02841357648772461
+    workspace_frame: table_workspace

@@ -1,0 +1,5 @@
+# Inference-only dependencies (install in a ROS-Humble-compatible Python 3.10 environment).
+# Select the appropriate CPU/CUDA PyTorch wheel for the host before installing.
+# ROS dependencies are declared in aloha_perception/package.xml.
+torch
+ultralytics
