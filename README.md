@@ -115,7 +115,7 @@ source /opt/ros/humble/setup.bash
 source ~/interbotix_ws/install/local_setup.bash
 source ~/interbotix_ws/src/aloha_tracking_ws/install/local_setup.bash
 
-ros2 run rqt_image_view rqt_image_view
+ros2 run rqt_image_view rqt_image_view --clear-config
 ```
 
 > Select /aloha/perception/debug_image without the /compressed suffix. With a valid detection, the overlay shows the filtered workspace XYZ values. XY is relative to the saved table center; Z remains relative to the left robot base
